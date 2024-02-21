@@ -15,6 +15,7 @@ class Network(BaseNetwork):
         
         self.denoise_fn = UNet(**unet)
         self.beta_schedule = beta_schedule
+        self.model_mean_type = 'dualx'
 
     def set_loss(self, loss_fn):
         self.loss_fn = loss_fn
@@ -58,10 +59,34 @@ class Network(BaseNetwork):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, y_t.shape)
         return posterior_mean, posterior_log_variance_clipped
 
+    def q_posterior_mean_dualx(self, x_0, x_t, t):
+        mean = (extract(self.posterior_mean_coef1, t, x_t.shape) * x_0
+                + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t)
+        return mean
+
+    def q_posterior_mean_dualx_implicit(self, x_0, x_t, t, noise):
+        if x_0 is None:
+            # predict mean using x_t and noise
+            betas = extract(self.betas, t, x_t.shape)
+            alphas = 1 - betas
+            alphas_cumprod = extract(self.alphas_cumprod, t, x_t.shape)
+            sqrt_one_minus_alphas_cumprod = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+
+            posterior_ddim_coef = torch.sqrt(alphas - alphas_cumprod) - sqrt_one_minus_alphas_cumprod
+            mean = (x_t + posterior_ddim_coef * noise) / torch.sqrt(alphas)
+        else:
+            # predict mean using x_0 and noise
+            sqrt_alphas_cumprod_prev = extract(self.sqrt_alphas_cumprod_prev, t, x_0.shape)
+            sqrt_one_minus_alphas_cumprod_prev = extract(self.sqrt_one_minus_alphas_cumprod_prev, t, x_0.shape)
+
+            mean = sqrt_alphas_cumprod_prev * x_0 + sqrt_one_minus_alphas_cumprod_prev * noise
+
+        return mean
+
     def p_mean_variance(self, y_t, t, clip_denoised: bool, y_cond=None):
         noise_level = extract(self.gammas, t, x_shape=(1, 1)).to(y_t.device)
         y_0_hat = self.predict_start_from_noise(
-                y_t, t=t, noise=self.denoise_fn(torch.cat([y_cond, y_t], dim=1), noise_level))
+                y_t, t=t, noise=self.denoise_fn(torch.cat([y_cond, y_t], dim=1), noise_level)[:, 3:6])
 
         if clip_denoised:
             y_0_hat.clamp_(-1., 1.)
@@ -102,6 +127,31 @@ class Network(BaseNetwork):
                 ret_arr = torch.cat([ret_arr, y_t], dim=0)
         return y_t, ret_arr
 
+    def predict_dualx(self, model_output, x_t, t, mode=None, is_implicit=False, return_pred_x0=False, fn=None):
+
+        model_output_xstart, model_output_eps, model_output_thr = model_output[:, :3], model_output[:, 3:6], model_output[:, 6:7]
+        pred_x0_xstart = model_output_xstart
+        pred_x0_eps = self.predict_start_from_noise(x_t, t, model_output_eps)
+
+        s = model_output_thr.sigmoid()
+        pred_x0_thr = s * pred_x0_xstart.detach() + (1-s) * (pred_x0_eps).detach()
+
+        if not is_implicit:
+            model_output_thr_mean = self.q_posterior_mean_dualx(x_0=pred_x0_thr, x_t=x_t, t=t)
+        else:
+            pred_noise_thr = self.predict_noise_from_start(pred_x0_thr, x_t, t)
+            model_output_thr_mean = self.q_posterior_mean_dualx_implicit(x_0=pred_x0_thr, x_t=x_t, t=t, noise=pred_noise_thr)
+
+        if mode == 'mean':
+            if not return_pred_x0:
+                return model_output_thr_mean
+            else:
+                return model_output_thr_mean, pred_x0_thr
+        else:
+            assert mode is None
+            pred = torch.cat((model_output_xstart, model_output_eps, model_output_thr_mean), dim=1)
+            return pred
+
     def forward(self, y_0, y_cond=None, mask=None, noise=None):
         # sampling from p(gammas)
         b, *_ = y_0.shape
@@ -116,11 +166,32 @@ class Network(BaseNetwork):
             y_0=y_0, sample_gammas=sample_gammas.view(-1, 1, 1, 1), noise=noise)
 
         if mask is not None:
-            noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy*mask+(1.-mask)*y_0], dim=1), sample_gammas)
-            loss = self.loss_fn(mask*noise, mask*noise_hat)
+            # noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy*mask+(1.-mask)*y_0], dim=1), sample_gammas)
+            # loss = self.loss_fn(mask*noise, mask*noise_hat)
+
+            model_output = self.denoise_fn(torch.cat([y_cond, y_noisy*mask+(1.-mask)*y_0], dim=1), sample_gammas)
+            mean = self.q_posterior_mean_dualx(x_0=y_0, x_t=y_noisy, t=t)
+            target = {
+                'xprev': lambda: mean,
+                'xstart': lambda: y_0,
+                'eps': lambda: noise,
+                'dualx': lambda: torch.cat((y_0, noise, mean), dim=1),
+            }[self.model_mean_type]()
+            if self.model_mean_type != 'dualx':
+                assert model_output.shape[1] == 3
+                pred = model_output
+            else:
+                assert model_output.shape[1] == 7
+                pred = self.predict_dualx(model_output=model_output, x_t=y_noisy, t=t)
+
+            losses = torch.mean((target - pred).view(y_0.shape[0], -1) ** 2, dim=1)
+
+            loss = losses.mean()
+
         else:
             noise_hat = self.denoise_fn(torch.cat([y_cond, y_noisy], dim=1), sample_gammas)
             loss = self.loss_fn(noise, noise_hat)
+
         return loss
 
 

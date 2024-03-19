@@ -19,7 +19,7 @@
             "which_dataset": {  // import designated dataset using arguments 
                 "name": ["data.dataset", "InpaintDataset"], // import Dataset() class / function(not recommend) from data.dataset.py (default is [data.dataset.py])
                 "args":{ // arguments to initialize dataset
-                    "data_root": "datasets/celebahq/flist/train.flist",
+                    "data_root": "/kaggle/input/celeba-64",
                     "data_len": -1,
                     "mask_config": {
                         "mask_mode": "hybrid"
@@ -104,7 +104,7 @@
                         "num_head_channels": 32,
                         "res_blocks": 2,
                         "dropout": 0.2,
-                        "image_size": 256
+                        "image_size": 64
                     },
                     "beta_schedule": {
                         "train": {
@@ -139,7 +139,7 @@
         "val_epoch": 5, // valdation every specified number of epochs
         "save_checkpoint_epoch": 1,
         "log_iter": 1e3, // log every specified number of iterations
-        "tensorboard" : true // tensorboardX enable
+        "tensorboard" : false // tensorboardX enable
     },
     
     "debug": { // arguments in debug mode, which will replace arguments in train
